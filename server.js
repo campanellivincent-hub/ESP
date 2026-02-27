@@ -2,29 +2,15 @@
  * ═══════════════════════════════════════════════════════════
  *  SERVEUR ESP — PONT DE TRANSMISSION EN TEMPS RÉEL
  *  Stack : Node.js + Express (SSE natif, sans dépendance lourde)
- * ═══════════════════════════════════════════════════════════
  *
- *  INSTALLATION :
- *    npm install express cors
+ *  TOURS SUPPORTÉS :
+ *    ① Zener  — POST /zener/transmit  · GET /zener/stream
+ *    ② Go-Gyō — POST /gogyo/transmit  · GET /gogyo/stream
  *
- *  LANCEMENT LOCAL :
- *    node server.js
- *    → http://localhost:3000
+ *  Rétro-compatibilité : /transmit et /stream → Zener
  *
- *  DÉPLOIEMENT GRATUIT SUR RENDER.COM :
- *    1. Créer compte sur render.com
- *    2. "New Web Service" → connecter votre repo GitHub
- *       (avec server.js + package.json à la racine)
- *    3. Build command : npm install
- *    4. Start command  : node server.js
- *    5. Copier l'URL obtenue (ex: https://mon-projet.onrender.com)
- *    6. Remplacer SERVER_URL dans spectateur.html et magicien.html
- *
- *  ENDPOINTS :
- *    POST /transmit   — spectateur envoie son symbole
- *    GET  /stream     — SSE pour le téléphone du magicien
- *    GET  /latest     — dernier symbole (fallback polling)
- *    GET  /health     — état du serveur
+ *  ENDPOINTS COMMUNS :
+ *    GET /health  — état global du serveur
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -36,80 +22,89 @@ const PORT    = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// État partagé
-let lastSymbol  = null;
-let sseClients  = new Set();
+const SYMBOL_TTL = 60_000; // 60 secondes
 
-// ── POST /transmit ─────────────────────────────────────────────────────────
-app.post('/transmit', (req, res) => {
-  const { symbol, n } = req.body;
-  const valid = ['cercle', 'croix', 'vagues', 'carre', 'etoile'];
+// ── Canal SSE générique ───────────────────────────────────────────────────
+function createChannel(validSymbols, label) {
+  let lastSymbol = null;
+  const clients  = new Set();
 
-  if (!symbol || !valid.includes(symbol)) {
-    return res.status(400).json({ error: 'Invalide' });
-  }
-
-  lastSymbol = { symbol, n: Number(n), timestamp: Date.now() };
-  console.log(`▶ Reçu : ${symbol} (${n} vib) — ${sseClients.size} client(s) connecté(s)`);
-
-  // Push immédiat vers tous les clients SSE
-  const payload = JSON.stringify(lastSymbol);
-  for (const client of sseClients) {
-    try {
-      client.write(`data: ${payload}\n\n`);
-    } catch (_) {
-      sseClients.delete(client);
+  function transmit(req, res) {
+    const { symbol, n } = req.body;
+    if (!symbol || !validSymbols.includes(symbol)) {
+      return res.status(400).json({ error: 'Symbole invalide' });
     }
+    lastSymbol = { symbol, n: Number(n) || 0, timestamp: Date.now() };
+    console.log(`[${label}] ▶ ${symbol} — ${clients.size} client(s)`);
+    const payload = JSON.stringify(lastSymbol);
+    for (const client of clients) {
+      try { client.write(`data: ${payload}\n\n`); }
+      catch (_) { clients.delete(client); }
+    }
+    res.status(204).end();
   }
 
-  res.status(204).end(); // Réponse vide — aucun indice visuel
-});
+  function stream(req, res) {
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
 
-// ── GET /stream — Server-Sent Events ──────────────────────────────────────
-app.get('/stream', (req, res) => {
-  res.setHeader('Content-Type',      'text/event-stream');
-  res.setHeader('Cache-Control',     'no-cache');
-  res.setHeader('Connection',        'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Désactive le buffer Nginx
-  res.flushHeaders();
+    clients.add(res);
+    console.log(`[${label}] + connecté. Total : ${clients.size}`);
 
-  sseClients.add(res);
-  console.log(`+ Magicien connecté. Total : ${sseClients.size}`);
+    // Envoie le dernier symbole seulement s'il est récent (< 60s)
+    if (lastSymbol && (Date.now() - lastSymbol.timestamp) < SYMBOL_TTL) {
+      res.write(`data: ${JSON.stringify(lastSymbol)}\n\n`);
+    }
 
-  // Si un symbole a déjà été reçu, l'envoyer immédiatement
-  if (lastSymbol) {
-    res.write(`data: ${JSON.stringify(lastSymbol)}\n\n`);
+    const hb = setInterval(() => {
+      try { res.write(': ping\n\n'); }
+      catch (_) { clearInterval(hb); }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(hb);
+      clients.delete(res);
+      console.log(`[${label}] - déconnecté. Total : ${clients.size}`);
+    });
   }
 
-  // Heartbeat toutes les 25s pour éviter le timeout Render/Cloudflare
-  const hb = setInterval(() => {
-    try { res.write(': ping\n\n'); }
-    catch (_) { clearInterval(hb); }
-  }, 25000);
+  function latest(_req, res) {
+    res.json(lastSymbol ?? { symbol: null, n: null });
+  }
 
-  req.on('close', () => {
-    clearInterval(hb);
-    sseClients.delete(res);
-    console.log(`- Magicien déconnecté. Total : ${sseClients.size}`);
-  });
-});
+  return { transmit, stream, latest };
+}
 
-// ── GET /latest — Fallback polling ────────────────────────────────────────
-app.get('/latest', (_req, res) => {
-  res.json(lastSymbol ?? { symbol: null, n: null });
-});
+// ── Tour ① : Zener ────────────────────────────────────────────────────────
+const zener = createChannel(
+  ['cercle', 'croix', 'vagues', 'carre', 'etoile'], 'ZENER'
+);
+app.post('/zener/transmit', zener.transmit);
+app.get('/zener/stream',    zener.stream);
+app.get('/zener/latest',    zener.latest);
+// Rétro-compatibilité (anciens fichiers)
+app.post('/transmit', zener.transmit);
+app.get('/stream',    zener.stream);
+app.get('/latest',    zener.latest);
 
-// ── GET /health ────────────────────────────────────────────────────────────
+// ── Tour ② : Go-Gyō (五行) ───────────────────────────────────────────────
+const gogyo = createChannel(
+  ['bois', 'feu', 'terre', 'metal', 'eau'], 'GO-GYŌ'
+);
+app.post('/gogyo/transmit', gogyo.transmit);
+app.get('/gogyo/stream',    gogyo.stream);
+app.get('/gogyo/latest',    gogyo.latest);
+
+// ── Santé ─────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({
-    status:     'ok',
-    uptime:     Math.round(process.uptime()) + 's',
-    clients:    sseClients.size,
-    lastSymbol: lastSymbol?.symbol ?? 'aucun'
-  });
+  res.json({ status: 'ok', uptime: Math.round(process.uptime()) + 's', tours: ['zener', 'gogyo'] });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🎩  Serveur ESP prêt sur le port ${PORT}`);
-  console.log(`    Local  : http://localhost:${PORT}/health\n`);
+  console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
+  console.log(`    Zener  : /zener/transmit · /zener/stream`);
+  console.log(`    Go-Gyō : /gogyo/transmit · /gogyo/stream\n`);
 });
