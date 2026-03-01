@@ -29,11 +29,12 @@ function createChannel(validSymbols, label) {
   const clients  = new Set();
 
   function transmit(req, res) {
-    const { symbol, n } = req.body;
+    const { symbol, n, day, month, year } = req.body;
     if (!symbol || !validSymbols.includes(symbol)) {
       return res.status(400).json({ error: 'Symbole invalide' });
     }
-    lastSymbol = { symbol, n: Number(n) || 0, timestamp: Date.now() };
+    lastSymbol = { symbol, n: Number(n) || 0, timestamp: Date.now(),
+                   day: day || null, month: month || null, year: year || null };
     console.log(`[${label}] ▶ ${symbol} — ${clients.size} client(s)`);
     const payload = JSON.stringify(lastSymbol);
     for (const client of clients) {
@@ -158,12 +159,23 @@ app.get('/gogyo/latest',    gogyo.latest);
   });
 }
 
+
+// ── Tour ④ : Astrologie (12 signes) ──────────────────────────────────────
+const astro = createChannel(
+  ['belier','taureau','gemeaux','cancer','lion','vierge',
+   'balance','scorpion','sagittaire','capricorne','verseau','poissons'],
+  'ASTRO'
+);
+app.post('/astro/transmit', astro.transmit);
+app.get('/astro/stream',    astro.stream);
+app.get('/astro/latest',    astro.latest);
+
 // ── Santé ─────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
     status:  'ok',
     uptime:  Math.round(process.uptime()) + 's',
-    tours:   ['zener', 'gogyo', 'oracle'],
+    tours:   ['zener', 'gogyo', 'oracle', 'astro'],
   });
 });
 
