@@ -3,6 +3,14 @@
  *  SERVEUR ESP — PONT DE TRANSMISSION EN TEMPS RÉEL
  *  Stack : Node.js + Express + WebSocket (ws)
  *
+ *  SÉCURITÉ MAGICIEN :
+ *    Chaque route /*/transmit et les WS role=magicien
+ *    exigent un header  X-Magicien-Key: <clé personnelle>
+ *    Les clés sont définies dans MAGICIEN_KEYS ci-dessous.
+ *    Chaque accès est journalisé (IP, identifiant, date).
+ *
+ *  JOURNAL : GET /admin/log  (header X-Admin-Key requis)
+ *
  *  TOURS SSE :
  *    ① Zener      — POST /zener/transmit   · GET /zener/stream
  *    ② Go-Gyō     — POST /gogyo/transmit   · GET /gogyo/stream
@@ -11,8 +19,8 @@
  *    ⑦ Cadenas    — POST /cadenas/transmit · GET /cadenas/stream
  *
  *  TOURS WebSocket :
- *    ⑤ Magic Draw — ws://.../?role=spectateur|magicien
- *    ⑥ Atelier    — ws://.../?role=spectateur|magicien&canal=atelier
+ *    ⑤ Magic Draw — ws://.../?role=spectateur|magicien&key=<clé>
+ *    ⑥ Atelier    — ws://.../?role=spectateur|magicien&canal=atelier&key=<clé>
  *
  *  Rétro-compatibilité : /transmit et /stream → Zener
  *  GET /health — état global
@@ -25,21 +33,94 @@ const http     = require('http');
 const https    = require('https');
 const { WebSocketServer } = require('ws');
 
-const app    = express();
-const PORT   = process.env.PORT || 3000;
+const app  = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Serveur HTTP partagé — Express + WebSocket sur le même port
 const server = http.createServer(app);
 const wss    = new WebSocketServer({ server });
+
+// ════════════════════════════════════════════════════════════
+//  GESTION DES CLÉS MAGICIENS
+//  Format : { 'clé-secrète': 'Nom Affiché' }
+//  → Modifiez cette liste pour ajouter / révoquer des accès.
+//  → Vous pouvez aussi passer par la variable d'env MAGICIEN_KEYS_JSON
+//    avec un JSON stringifié du même format.
+// ════════════════════════════════════════════════════════════
+
+const MAGICIEN_KEYS = process.env.MAGICIEN_KEYS_JSON
+  ? JSON.parse(process.env.MAGICIEN_KEYS_JSON)
+  : {
+      'CLE-ALICE-2025':  'Alice',
+      'CLE-BOB-2025':    'Bob',
+      'CLE-CHARLIE-2025':'Charlie',
+      // Ajoutez autant de clés que nécessaire
+    };
+
+// Clé admin pour consulter le journal
+const ADMIN_KEY = process.env.ADMIN_KEY || 'MON-MOT-DE-PASSE-ADMIN';
+
+// ════════════════════════════════════════════════════════════
+//  JOURNAL DES ACCÈS (stocké en RAM, max 500 entrées)
+// ════════════════════════════════════════════════════════════
+
+const accessLog = [];
+const MAX_LOG   = 500;
+
+function logAccess({ name, key, ip, route, canal }) {
+  const entry = {
+    ts:    new Date().toISOString(),
+    name:  name || '?',
+    key:   key  || '?',
+    ip:    ip   || '?',
+    route: route || '?',
+    canal: canal || null,
+  };
+  accessLog.unshift(entry);
+  if (accessLog.length > MAX_LOG) accessLog.length = MAX_LOG;
+  console.log(`[ACCÈS] ${entry.ts} | ${entry.name} (${entry.ip}) → ${entry.route}`);
+}
+
+// ════════════════════════════════════════════════════════════
+//  MIDDLEWARE D'AUTHENTIFICATION MAGICIEN (HTTP)
+//  Lit X-Magicien-Key dans le header ou "key" dans le body.
+// ════════════════════════════════════════════════════════════
+
+function authMagicien(req, res, next) {
+  const key  = req.headers['x-magicien-key'] || req.body?.key || '';
+  const name = MAGICIEN_KEYS[key];
+  if (!name) {
+    console.warn(`[AUTH] Clé refusée : "${key}" depuis ${req.ip}`);
+    return res.status(401).json({ error: 'Clé magicien invalide ou absente.' });
+  }
+  req.magicienName = name;
+  req.magicienKey  = key;
+  logAccess({ name, key, ip: req.ip, route: req.path });
+  next();
+}
+
+// ════════════════════════════════════════════════════════════
+//  ENDPOINT ADMIN — journal des accès
+// ════════════════════════════════════════════════════════════
+
+app.get('/admin/log', (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key || '';
+  if (key !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Accès refusé.' });
+  }
+  res.json({
+    total:   accessLog.length,
+    entries: accessLog,
+  });
+});
 
 // ════════════════════════════════════════════════════════════
 //  PARTIE SSE
 // ════════════════════════════════════════════════════════════
 
-const SYMBOL_TTL = 60_000; // 60 secondes
+const SYMBOL_TTL = 60_000;
 
 function createChannel(validSymbols, label) {
   let lastSymbol = null;
@@ -54,7 +135,7 @@ function createChannel(validSymbols, label) {
       symbol, n: Number(n) || 0, timestamp: Date.now(),
       day: day || null, month: month || null, year: year || null
     };
-    console.log(`[${label}] ▶ ${symbol} — ${clients.size} client(s)`);
+    console.log(`[${label}] ▶ ${symbol} par ${req.magicienName} — ${clients.size} client(s)`);
     const payload = JSON.stringify(lastSymbol);
     for (const client of clients) {
       try { client.write(`data: ${payload}\n\n`); }
@@ -71,7 +152,7 @@ function createChannel(validSymbols, label) {
     res.flushHeaders();
 
     clients.add(res);
-    console.log(`[${label}] + connecté. Total : ${clients.size}`);
+    console.log(`[${label}] + spectateur connecté. Total : ${clients.size}`);
 
     if (lastSymbol && (Date.now() - lastSymbol.timestamp) < SYMBOL_TTL) {
       res.write(`data: ${JSON.stringify(lastSymbol)}\n\n`);
@@ -85,7 +166,7 @@ function createChannel(validSymbols, label) {
     req.on('close', () => {
       clearInterval(hb);
       clients.delete(res);
-      console.log(`[${label}] - déconnecté. Total : ${clients.size}`);
+      console.log(`[${label}] - spectateur déconnecté. Total : ${clients.size}`);
     });
   }
 
@@ -100,11 +181,11 @@ function createChannel(validSymbols, label) {
 const zener = createChannel(
   ['cercle', 'croix', 'vagues', 'carre', 'etoile'], 'ZENER'
 );
-app.post('/zener/transmit', zener.transmit);
+app.post('/zener/transmit', authMagicien, zener.transmit);
 app.get('/zener/stream',    zener.stream);
 app.get('/zener/latest',    zener.latest);
 // Rétro-compatibilité
-app.post('/transmit', zener.transmit);
+app.post('/transmit', authMagicien, zener.transmit);
 app.get('/stream',    zener.stream);
 app.get('/latest',    zener.latest);
 
@@ -112,7 +193,7 @@ app.get('/latest',    zener.latest);
 const gogyo = createChannel(
   ['bois', 'feu', 'terre', 'metal', 'eau'], 'GO-GYŌ'
 );
-app.post('/gogyo/transmit', gogyo.transmit);
+app.post('/gogyo/transmit', authMagicien, gogyo.transmit);
 app.get('/gogyo/stream',    gogyo.stream);
 app.get('/gogyo/latest',    gogyo.latest);
 
@@ -123,13 +204,13 @@ app.get('/gogyo/latest',    gogyo.latest);
   let   lastOracle    = null;
   const oracleClients = new Set();
 
-  app.post('/oracle/transmit', (req, res) => {
+  app.post('/oracle/transmit', authMagicien, (req, res) => {
     const { symbol, token } = req.body;
     if (!symbol || !ORACLE_VALID.includes(symbol)) {
       return res.status(400).json({ error: 'Symbole invalide' });
     }
     lastOracle = { symbol, timestamp: Date.now(), token: token || null };
-    console.log(`[ORACLE] ▶ ${symbol} — ${oracleClients.size} client(s)`);
+    console.log(`[ORACLE] ▶ ${symbol} par ${req.magicienName} — ${oracleClients.size} client(s)`);
     const payload = JSON.stringify(lastOracle);
     for (const client of oracleClients) {
       try { client.write(`data: ${payload}\n\n`); }
@@ -172,7 +253,7 @@ const astro = createChannel(
    'balance','scorpion','sagittaire','capricorne','verseau','poissons'],
   'ASTRO'
 );
-app.post('/astro/transmit', astro.transmit);
+app.post('/astro/transmit', authMagicien, astro.transmit);
 app.get('/astro/stream',    astro.stream);
 app.get('/astro/latest',    astro.latest);
 
@@ -182,13 +263,13 @@ app.get('/astro/latest',    astro.latest);
   let   lastCode    = null;
   const cadeClients = new Set();
 
-  app.post('/cadenas/transmit', (req, res) => {
+  app.post('/cadenas/transmit', authMagicien, (req, res) => {
     const { code } = req.body;
     if (!code || !/^\d{4}$/.test(code)) {
       return res.status(400).json({ error: 'Code invalide (4 chiffres requis)' });
     }
     lastCode = { code, timestamp: Date.now() };
-    console.log(`[CADENAS] ▶ ${code} — ${cadeClients.size} client(s)`);
+    console.log(`[CADENAS] ▶ ${code} par ${req.magicienName} — ${cadeClients.size} client(s)`);
     const payload = JSON.stringify(lastCode);
     for (const client of cadeClients) {
       try { client.write(`data: ${payload}\n\n`); }
@@ -239,6 +320,7 @@ app.get('/health', (_req, res) => {
 
 // ════════════════════════════════════════════════════════════
 //  PARTIE WEBSOCKET (Magic Draw + Atelier)
+//  Authentification : ?role=magicien&key=<clé>
 // ════════════════════════════════════════════════════════════
 
 const PUSHOVER_TOKEN = process.env.PUSHOVER_TOKEN || '';
@@ -253,8 +335,24 @@ wss.on('connection', (ws, req) => {
   const url   = new URL(req.url, 'http://localhost');
   const role  = url.searchParams.get('role');
   const canal = url.searchParams.get('canal');
+  const key   = url.searchParams.get('key') || '';
+  const ip    = req.socket.remoteAddress || '?';
 
-  console.log(`[WS] role=${role} canal=${canal || 'draw'}`);
+  // Vérification de la clé pour le rôle magicien
+  if (role === 'magicien') {
+    const name = MAGICIEN_KEYS[key];
+    if (!name) {
+      console.warn(`[WS AUTH] Clé WS refusée : "${key}" depuis ${ip}`);
+      ws.send(JSON.stringify({ type: 'error', message: 'Clé magicien invalide.' }));
+      ws.close(4001, 'Unauthorized');
+      return;
+    }
+    logAccess({ name, key, ip, route: `WS canal=${canal || 'draw'}`, canal: canal || 'draw' });
+    ws.magicienName = name;
+    console.log(`[WS] Magicien "${name}" connecté — canal=${canal || 'draw'}`);
+  } else {
+    console.log(`[WS] Spectateur connecté — canal=${canal || 'draw'}`);
+  }
 
   // ── Canal Atelier ──────────────────────────────────────────
   if (canal === 'atelier') {
@@ -358,5 +456,7 @@ function sendPushoverImage(base64Data) {
 server.listen(PORT, () => {
   console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
   console.log(`    SSE : Zener · Go-Gyō · Oracle · Astro`);
-  console.log(`    WS  : Draw (?role=) · Atelier (?role=&canal=atelier)\n`);
+  console.log(`    WS  : Draw (?role=&key=) · Atelier (?role=&canal=atelier&key=)`);
+  console.log(`    Admin log : GET /admin/log  (header X-Admin-Key)\n`);
+  console.log(`    Magiciens enregistrés : ${Object.values(MAGICIEN_KEYS).join(', ')}\n`);
 });
