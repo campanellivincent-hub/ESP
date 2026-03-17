@@ -16,14 +16,6 @@
  *    GET  /admin/stats             — statistiques globales
  *    WS   /?role=admin             — push temps réel vers l'admin
  *
- *  ROOMS PRIVÉES (isolation par magicien) :
- *    POST /room/create              — crée une room, retourne roomId
- *    DELETE /room/:id               — ferme une room
- *    POST /room/:id/transmit        — envoie un symbole dans la room
- *    GET  /room/:id/stream          — SSE du spectateur (public)
- *    GET  /room/:id/status          — état de la room (active/inactive)
- *    GET  /rooms                    — liste des rooms actives (admin)
- *
  *  TOURS SSE (protégés par token) :
  *    ① Zener      — POST /zener/transmit   · GET /zener/stream
  *    ② Go-Gyō     — POST /gogyo/transmit   · GET /gogyo/stream
@@ -574,201 +566,7 @@ app.get('/astro/latest',    astro.latest);
 
 // ── Santé ────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: Math.round(process.uptime()) + 's', sessions: activeSessions.size, rooms: activeRooms.size });
-});
-
-// ════════════════════════════════════════════════════════════
-//  ROOMS PRIVÉES — isolation par magicien
-//  Chaque room est liée à un userId et vit tant que le magicien
-//  est connecté (keepalive SSE) ou jusqu'à fermeture explicite.
-// ════════════════════════════════════════════════════════════
-
-// roomId → { id, userId, username, name, createdAt, lastActivity,
-//             clients: Set<res>, lastSymbol, spectatorCount }
-const activeRooms = new Map();
-
-// Génère un ID court lisible (6 chars, sans ambiguïtés 0/O 1/I)
-function genRoomId() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let id;
-  do { id = Array.from({length:6}, () => chars[Math.floor(Math.random()*chars.length)]).join(''); }
-  while (activeRooms.has(id));
-  return id;
-}
-
-// ── Créer une room ───────────────────────────────────────────
-app.post('/room/create', requireAuth, (req, res) => {
-  // Un magicien ne peut avoir qu'une room active à la fois
-  const existing = [...activeRooms.values()].find(r => r.userId === req.user.id);
-  if (existing) {
-    // Retourne la room existante plutôt que d'en créer une nouvelle
-    return res.json({ roomId: existing.id, created: false });
-  }
-
-  const roomId = genRoomId();
-  const room = {
-    id:             roomId,
-    userId:         req.user.id,
-    username:       req.user.username,
-    name:           req.user.name,
-    createdAt:      Date.now(),
-    lastActivity:   Date.now(),
-    clients:        new Set(),   // spectateurs SSE connectés
-    lastSymbol:     null,
-    spectatorCount: 0
-  };
-  activeRooms.set(roomId, room);
-  console.log(`[ROOM] Créée ${roomId} par ${req.user.username}`);
-
-  broadcastAdminEvent('room_created', {
-    roomId, userId: req.user.id, username: req.user.username, name: req.user.name
-  });
-
-  res.json({ roomId, created: true });
-});
-
-// ── Fermer une room ──────────────────────────────────────────
-app.delete('/room/:id', requireAuth, (req, res) => {
-  const room = activeRooms.get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room introuvable' });
-  if (room.userId !== req.user.id && req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Accès refusé' });
-  }
-  closeRoom(req.params.id, 'closed_by_magician');
-  res.status(204).end();
-});
-
-function closeRoom(roomId, reason) {
-  const room = activeRooms.get(roomId);
-  if (!room) return;
-  // Notifie les spectateurs connectés que la room est fermée
-  const goodbye = JSON.stringify({ type: 'room_closed', reason });
-  for (const client of room.clients) {
-    try { client.write(`data: ${goodbye}\n\n`); client.end(); } catch(_) {}
-  }
-  room.clients.clear();
-  activeRooms.delete(roomId);
-  console.log(`[ROOM] Fermée ${roomId} (${reason})`);
-  broadcastAdminEvent('room_closed', { roomId, reason });
-}
-
-// ── Status d'une room (public — pour la page spectateur) ─────
-app.get('/room/:id/status', (req, res) => {
-  const room = activeRooms.get(req.params.id);
-  if (!room) return res.json({ active: false });
-  res.json({ active: true, spectatorCount: room.spectatorCount });
-});
-
-// ── Transmettre un symbole dans une room ─────────────────────
-// Route authentifiée (pour usage avancé / tests)
-app.post('/room/:id/transmit', requireAuth, (req, res) => {
-  const room = activeRooms.get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room introuvable ou expirée' });
-  if (room.userId !== req.user.id) return res.status(403).json({ error: 'Cette room ne vous appartient pas' });
-  return transmitToRoom(req.params.id, req.body, req.user.id, req.payload.sessionId, res);
-});
-
-// Route publique — utilisée par la page spectateur (sans auth)
-app.post('/room/:id/public-transmit', (req, res) => {
-  const room = activeRooms.get(req.params.id);
-  if (!room) return res.status(404).json({ error: 'Room introuvable ou expirée' });
-  return transmitToRoom(req.params.id, req.body, null, null, res);
-});
-
-function transmitToRoom(roomId, body, userId, sessionId, res) {
-  const room = activeRooms.get(roomId);
-  const { symbol, n } = body;
-  const VALID = ['cercle', 'croix', 'vagues', 'carre', 'etoile',
-                 'bois', 'feu', 'terre', 'metal', 'eau',
-                 'belier','taureau','gemeaux','cancer','lion','vierge',
-                 'balance','scorpion','sagittaire','capricorne','verseau','poissons'];
-  if (!symbol || !VALID.includes(symbol)) {
-    return res.status(400).json({ error: 'Symbole invalide' });
-  }
-
-  room.lastSymbol   = { symbol, n: Number(n) || 0, timestamp: Date.now() };
-  room.lastActivity = Date.now();
-
-  const payload = JSON.stringify(room.lastSymbol);
-  for (const client of room.clients) {
-    try { client.write(`data: ${payload}\n\n`); }
-    catch (_) { room.clients.delete(client); }
-  }
-  console.log(`[ROOM ${roomId}] ▶ ${symbol} → ${room.clients.size} spectateur(s)`);
-
-  if (userId) {
-    logTransmission(userId, `ROOM:${roomId}`, symbol);
-    if (sessionId) touchSession(sessionId, `ROOM:${roomId}`);
-  } else {
-    broadcastAdminEvent('transmission', {
-      channel: `ROOM:${roomId}`, symbol, timestamp: Date.now(),
-      userId: null, username: 'spectateur', name: room.name
-    });
-  }
-  res.status(204).end();
-}
-
-// ── SSE spectateur d'une room ────────────────────────────────
-app.get('/room/:id/stream', (req, res) => {
-  const room = activeRooms.get(req.params.id);
-  if (!room) {
-    // Room inexistante : envoie un événement spécial puis ferme
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-    res.write(`data: ${JSON.stringify({ type: 'room_not_found' })}\n\n`);
-    res.end();
-    return;
-  }
-
-  res.setHeader('Content-Type',      'text/event-stream');
-  res.setHeader('Cache-Control',     'no-cache');
-  res.setHeader('Connection',        'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  room.clients.add(res);
-  room.spectatorCount++;
-  console.log(`[ROOM ${req.params.id}] + spectateur. Total: ${room.clients.size}`);
-
-  broadcastAdminEvent('spectator_joined', {
-    roomId: req.params.id, magicianName: room.name, spectatorCount: room.spectatorCount
-  });
-
-  // Renvoie le dernier symbole si récent (< 60s)
-  if (room.lastSymbol && (Date.now() - room.lastSymbol.timestamp) < 60_000) {
-    res.write(`data: ${JSON.stringify(room.lastSymbol)}\n\n`);
-  }
-
-  const hb = setInterval(() => {
-    try { res.write(': ping\n\n'); }
-    catch (_) { clearInterval(hb); }
-  }, 25000);
-
-  req.on('close', () => {
-    clearInterval(hb);
-    room.clients.delete(res);
-    room.spectatorCount = Math.max(0, room.spectatorCount - 1);
-    console.log(`[ROOM ${req.params.id}] - spectateur. Total: ${room.clients.size}`);
-    broadcastAdminEvent('spectator_left', { roomId: req.params.id, spectatorCount: room.spectatorCount });
-  });
-});
-
-// ── Liste des rooms actives (admin) ──────────────────────────
-app.get('/rooms', requireAdmin, (_req, res) => {
-  const list = [...activeRooms.values()].map(r => ({
-    id:             r.id,
-    userId:         r.userId,
-    username:       r.username,
-    name:           r.name,
-    createdAt:      r.createdAt,
-    lastActivity:   r.lastActivity,
-    spectatorCount: r.spectatorCount,
-    lastSymbol:     r.lastSymbol
-  }));
-  res.json(list);
+  res.json({ status: 'ok', uptime: Math.round(process.uptime()) + 's', sessions: activeSessions.size });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -885,8 +683,7 @@ function sendPushoverImage(base64Data) {
 server.listen(PORT, () => {
   console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
   console.log(`    SSE  : Zener · Go-Gyō · Oracle · Astro · Cadenas`);
-  console.log(`    ROOM : POST /room/create · GET /room/:id/stream · POST /room/:id/transmit`);
   console.log(`    WS   : Draw · Atelier · Admin (?role=admin&token=...)`);
   console.log(`    Auth : POST /auth/login · /auth/logout · GET /auth/me`);
-  console.log(`    Admin REST : /admin/users · /admin/sessions · /admin/stats · /rooms\n`);
+  console.log(`    Admin REST : /admin/users · /admin/sessions · /admin/stats\n`);
 });
