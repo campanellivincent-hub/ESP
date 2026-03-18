@@ -2,6 +2,7 @@
  * ═══════════════════════════════════════════════════════════
  *  SERVEUR ESP — PONT DE TRANSMISSION EN TEMPS RÉEL
  *  Stack : Node.js + Express + WebSocket (ws) + Auth JWT
+ *  Persistance : Redis (Railway)
  *
  *  AUTH :
  *    POST /auth/register  — création de compte (admin uniquement)
@@ -37,9 +38,8 @@ const cors     = require('cors');
 const http     = require('http');
 const https    = require('https');
 const crypto   = require('crypto');
-const fs       = require('fs');
-const path     = require('path');
 const { WebSocketServer } = require('ws');
+const { createClient } = require('redis');
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
@@ -55,21 +55,38 @@ const server = http.createServer(app);
 const wss    = new WebSocketServer({ server });
 
 // ════════════════════════════════════════════════════════════
-//  PERSISTANCE — fichier users.json
+//  CONNEXION REDIS
 // ════════════════════════════════════════════════════════════
 
-const USERS_FILE = path.join(__dirname, 'users.json');
+const redisClient = createClient({
+  url: process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || 'redis://localhost:6379'
+});
+
+redisClient.on('error', (err) => console.error('[REDIS] Erreur:', err.message));
+redisClient.on('connect', () => console.log('[REDIS] Connecté ✓'));
+
+// ════════════════════════════════════════════════════════════
+//  PERSISTANCE — Redis
+// ════════════════════════════════════════════════════════════
+
+const REDIS_USERS_KEY = 'esp:users';
 
 function hashPassword(pwd) {
   return crypto.createHmac('sha256', 'esp-salt-2024').update(pwd).digest('hex');
 }
 
-function loadUsers() {
+async function loadUsers() {
   try {
-    if (fs.existsSync(USERS_FILE)) {
-      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    const data = await redisClient.get(REDIS_USERS_KEY);
+    if (data) {
+      console.log('[USERS] Chargés depuis Redis ✓');
+      return JSON.parse(data);
     }
-  } catch (_) {}
+  } catch (e) {
+    console.error('[USERS] Erreur lecture Redis:', e.message);
+  }
+
+  // Aucun utilisateur → créer le compte admin par défaut
   const adminId = crypto.randomUUID();
   const admin = {
     [adminId]: {
@@ -84,17 +101,21 @@ function loadUsers() {
       active: true
     }
   };
-  saveUsers(admin);
+  await saveUsers(admin);
   console.log(`\n🔑  Compte admin créé — login: admin / mdp: ${ADMIN_SECRET}\n`);
   return admin;
 }
 
-function saveUsers(u) {
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2)); }
-  catch (e) { console.error('[USERS] Erreur sauvegarde:', e.message); }
+async function saveUsers(u) {
+  try {
+    await redisClient.set(REDIS_USERS_KEY, JSON.stringify(u));
+  } catch (e) {
+    console.error('[USERS] Erreur sauvegarde Redis:', e.message);
+  }
 }
 
-let users = loadUsers();
+// users est initialisé après la connexion Redis (voir bas du fichier)
+let users = {};
 
 // ════════════════════════════════════════════════════════════
 //  SESSIONS ACTIVES (mémoire)
@@ -147,7 +168,7 @@ function getUserSessions(userId) {
 const transmissionLog = [];
 const MAX_LOG = 500;
 
-function logTransmission(userId, channel, symbol) {
+async function logTransmission(userId, channel, symbol) {
   const entry = {
     id: crypto.randomUUID(),
     userId,
@@ -163,7 +184,7 @@ function logTransmission(userId, channel, symbol) {
   if (users[userId]) {
     users[userId].totalTransmissions = (users[userId].totalTransmissions || 0) + 1;
     users[userId].lastActivity = Date.now();
-    saveUsers(users);
+    await saveUsers(users);
   }
   broadcastAdminEvent('transmission', entry);
   return entry;
@@ -220,7 +241,7 @@ function requireAdmin(req, res, next) {
 //  ROUTES AUTH
 // ════════════════════════════════════════════════════════════
 
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const { username, password, deviceInfo } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Champs manquants' });
 
@@ -247,7 +268,7 @@ app.post('/auth/login', (req, res) => {
   const sessionId = createSession(user.id, deviceInfo || req.headers['user-agent'] || 'inconnu', ip);
 
   users[user.id].lastLogin = Date.now();
-  saveUsers(users);
+  await saveUsers(users);
 
   const token = signJWT({
     userId: user.id,
@@ -283,7 +304,7 @@ app.get('/admin/users', requireAdmin, (_req, res) => {
   res.json(list);
 });
 
-app.post('/admin/users', requireAdmin, (req, res) => {
+app.post('/admin/users', requireAdmin, async (req, res) => {
   const { name, username, password, role } = req.body;
   if (!name || !username || !password) return res.status(400).json({ error: 'Champs manquants' });
   if (Object.values(users).find(u => u.username === username.toLowerCase().trim())) {
@@ -301,13 +322,13 @@ app.post('/admin/users', requireAdmin, (req, res) => {
     totalTransmissions: 0,
     active: true
   };
-  saveUsers(users);
+  await saveUsers(users);
   broadcastAdminEvent('user_created', { id, name, username: users[id].username, role: users[id].role });
   const { passwordHash, ...safe } = users[id];
   res.status(201).json(safe);
 });
 
-app.patch('/admin/users/:id', requireAdmin, (req, res) => {
+app.patch('/admin/users/:id', requireAdmin, async (req, res) => {
   const user = users[req.params.id];
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
   const { name, password, active, role } = req.body;
@@ -315,7 +336,7 @@ app.patch('/admin/users/:id', requireAdmin, (req, res) => {
   if (active !== undefined) user.active = !!active;
   if (role   !== undefined) user.role   = role === 'admin' ? 'admin' : 'magicien';
   if (password)             user.passwordHash = hashPassword(password);
-  saveUsers(users);
+  await saveUsers(users);
   if (active === false) {
     for (const [sid, s] of activeSessions) {
       if (s.userId === req.params.id) removeSession(sid);
@@ -326,12 +347,12 @@ app.patch('/admin/users/:id', requireAdmin, (req, res) => {
   res.json(safe);
 });
 
-app.delete('/admin/users/:id', requireAdmin, (req, res) => {
+app.delete('/admin/users/:id', requireAdmin, async (req, res) => {
   if (!users[req.params.id]) return res.status(404).json({ error: 'Introuvable' });
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Impossible de se supprimer soi-même' });
   const username = users[req.params.id].username;
   delete users[req.params.id];
-  saveUsers(users);
+  await saveUsers(users);
   for (const [sid, s] of activeSessions) {
     if (s.userId === req.params.id) removeSession(sid);
   }
@@ -397,7 +418,7 @@ function createChannel(validSymbols, label) {
   let lastSymbol = null;
   const clients  = new Set();
 
-  function transmit(req, res) {
+  async function transmit(req, res) {
     const { symbol, n, day, month, year } = req.body;
     if (!symbol || !validSymbols.includes(symbol)) {
       return res.status(400).json({ error: 'Symbole invalide' });
@@ -416,7 +437,7 @@ function createChannel(validSymbols, label) {
     lastSymbol = { symbol, n: Number(n) || 0, timestamp: Date.now(), day: day||null, month: month||null, year: year||null };
 
     if (userId) {
-      logTransmission(userId, label, symbol);
+      await logTransmission(userId, label, symbol);
     } else {
       broadcastAdminEvent('transmission', { channel: label, symbol, timestamp: Date.now(), userId: null, username: 'spectateur' });
     }
@@ -566,7 +587,12 @@ app.get('/astro/latest',    astro.latest);
 
 // ── Santé ────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: Math.round(process.uptime()) + 's', sessions: activeSessions.size });
+  res.json({
+    status: 'ok',
+    uptime: Math.round(process.uptime()) + 's',
+    sessions: activeSessions.size,
+    redis: redisClient.isOpen ? 'connecté' : 'déconnecté'
+  });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -678,12 +704,23 @@ function sendPushoverImage(base64Data) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  DÉMARRAGE
+//  DÉMARRAGE — Redis d'abord, puis serveur HTTP
 // ════════════════════════════════════════════════════════════
-server.listen(PORT, () => {
-  console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
-  console.log(`    SSE  : Zener · Go-Gyō · Oracle · Astro · Cadenas`);
-  console.log(`    WS   : Draw · Atelier · Admin (?role=admin&token=...)`);
-  console.log(`    Auth : POST /auth/login · /auth/logout · GET /auth/me`);
-  console.log(`    Admin REST : /admin/users · /admin/sessions · /admin/stats\n`);
+async function start() {
+  await redisClient.connect();
+  users = await loadUsers();
+
+  server.listen(PORT, () => {
+    console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
+    console.log(`    SSE  : Zener · Go-Gyō · Oracle · Astro · Cadenas`);
+    console.log(`    WS   : Draw · Atelier · Admin (?role=admin&token=...)`);
+    console.log(`    Auth : POST /auth/login · /auth/logout · GET /auth/me`);
+    console.log(`    Admin REST : /admin/users · /admin/sessions · /admin/stats`);
+    console.log(`    Redis : ${process.env.REDIS_URL ? 'Railway Redis ✓' : 'localhost (dev)'}\n`);
+  });
+}
+
+start().catch(err => {
+  console.error('Erreur démarrage:', err);
+  process.exit(1);
 });
