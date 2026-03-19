@@ -49,13 +49,26 @@ const JWT_SECRET   = process.env.JWT_SECRET || crypto.randomBytes(32).toString('
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'esp-admin-2024';
 
 // ── CORS — autorise toutes les origines y compris Netlify ────
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  next();
-});
+const allowedOrigins = [
+  'https://espadministrateur.netlify.app',
+  'http://localhost:5500', // Pour vos tests locaux VS Code
+  'http://127.0.0.1:5500'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Autorise les requêtes sans origine (comme les apps mobiles ou curl) 
+    // ou si l'origine est dans la liste
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Bloqué par CORS : Origine non autorisée'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
 app.use(express.json());
 
 const server = http.createServer(app);
