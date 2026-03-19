@@ -114,6 +114,13 @@ app.post('/auth/login', async (req, res) => {
   res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+
+// Verification du token (utilise par le magicien au demarrage)
+app.get("/auth/me", authenticate, (req, res) => {
+  const user = users.find(u => u.id === req.user.id);
+  if (!user) return res.status(404).json({ error: "Utilisateur introuvable" });
+  res.json({ id: user.id, username: user.username, name: user.name || user.username, role: user.role });
+});
 // Admin : Liste utilisateurs
 app.get('/admin/users', authenticate, isAdmin, (req, res) => {
   res.json(users);
@@ -200,6 +207,42 @@ TOURS.forEach(tour => {
 
     res.json({ success: true });
   });
+});
+
+
+// ════════════════════════════════════════════════════════════
+//  ROUTES GÉNÉRIQUES (compatibilité spectateur/magicien)
+// ════════════════════════════════════════════════════════════
+
+// Route générique /stream → redirige vers /zener/stream par défaut
+app.get('/stream', (req, res) => {
+  const tour = req.query.tour || 'zener';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const clientId = Date.now();
+  if (!activeStreams.has(tour)) activeStreams.set(tour, new Map());
+  activeStreams.get(tour).set(clientId, res);
+
+  req.on('close', () => {
+    activeStreams.get(tour).delete(clientId);
+  });
+});
+
+// Route générique /transmit → redirige vers /zener/transmit par défaut
+app.post('/transmit', async (req, res) => {
+  const tour = req.query.tour || req.body.tour || 'zener';
+  const data = { ...req.body, timestamp: Date.now() };
+
+  if (activeStreams.has(tour)) {
+    const message = `data: ${JSON.stringify(data)}\n\n`;
+    activeStreams.get(tour).forEach(client => client.write(message));
+  }
+
+  broadcastToAdmins({ type: 'transmission', tour, data });
+  res.json({ success: true });
 });
 
 // ════════════════════════════════════════════════════════════
