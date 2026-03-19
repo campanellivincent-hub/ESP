@@ -36,7 +36,7 @@ const corsOptions = {
       callback(new Error('Bloqué par CORS : Origine non autorisée'));
     }
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 };
@@ -101,6 +101,10 @@ app.post('/auth/login', async (req, res) => {
 
   if (!user) return res.status(401).json({ error: 'Identifiants incorrects' });
 
+  if (user.active === false) {
+    return res.status(403).json({ error: 'Compte désactivé' });
+  }
+
   const token = jwt.sign(
     { id: user.id, username: user.username, role: user.role },
     JWT_SECRET,
@@ -116,14 +120,39 @@ app.get('/admin/users', authenticate, isAdmin, (req, res) => {
 
 // Admin : Création de compte
 app.post('/admin/users', authenticate, isAdmin, async (req, res) => {
-  const { username, password, role } = req.body;
+  const { name, username, password, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username et password requis' });
+  }
   if (users.find(u => u.username === username)) {
     return res.status(400).json({ error: 'Cet utilisateur existe déjà' });
   }
-  const newUser = { id: crypto.randomUUID(), username, password, role: role || 'user', createdAt: Date.now() };
+  const newUser = {
+    id: crypto.randomUUID(),
+    name: name || username,
+    username,
+    password,
+    role: role || 'magicien',
+    active: true,
+    createdAt: Date.now()
+  };
   users.push(newUser);
   await saveUsers(users);
   res.status(201).json(newUser);
+});
+
+// Admin : Modification d'un compte (nom, mot de passe, active)
+app.patch('/admin/users/:id', authenticate, isAdmin, async (req, res) => {
+  const user = users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  const { name, password, active } = req.body;
+  if (name     !== undefined) user.name     = name;
+  if (password !== undefined && password !== '') user.password = password;
+  if (active   !== undefined) user.active   = active;
+
+  await saveUsers(users);
+  res.json({ success: true, user });
 });
 
 // Admin : Suppression de compte
@@ -209,21 +238,33 @@ async function start() {
   try {
     await redisClient.connect();
     users = await loadUsers();
-
-    // Création d'un admin par défaut si la liste est vide
-    if (users.length === 0) {
-      const defaultAdmin = { id: '1', username: 'admin', password: 'password123', role: 'admin' };
-      await saveUsers([defaultAdmin]);
-    }
-
-    server.listen(PORT, () => {
-      console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
-      console.log(`    Routes API & SSE : OK`);
-      console.log(`    WebSocket Server : OK`);
-    });
   } catch (err) {
-    console.error('Erreur lors du démarrage :', err);
+    console.error('Redis indisponible, démarrage sans persistance :', err);
+    users = [];
   }
+
+  // Création d'un admin par défaut si aucun admin n'existe
+  const adminExists = users.find(u => u.role === 'admin');
+  if (!adminExists) {
+    const defaultAdmin = {
+      id: '1',
+      name: 'Admin',
+      username: 'admin',
+      password: 'password123',
+      role: 'admin',
+      active: true,
+      createdAt: Date.now()
+    };
+    users.push(defaultAdmin);
+    try { await saveUsers(users); } catch(_) {}
+    console.log('Admin par défaut créé');
+  }
+
+  server.listen(PORT, () => {
+    console.log(`\n🎩  Serveur ESP prêt — port ${PORT}`);
+    console.log(`    Routes API & SSE : OK`);
+    console.log(`    WebSocket Server : OK`);
+  });
 }
 
 start();
