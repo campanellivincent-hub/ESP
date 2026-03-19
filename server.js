@@ -25,6 +25,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'esp-top-secret-key-2024';
 const allowedOrigins = [
   'https://espadministrateur.netlify.app',
   'https://espmagicien.netlify.app',
+  'https://esphistorique.netlify.app',
   'http://localhost:5500',
   'http://127.0.0.1:5500'
 ];
