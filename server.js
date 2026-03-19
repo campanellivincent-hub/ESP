@@ -48,7 +48,14 @@ const PORT   = process.env.PORT || 3000;
 const JWT_SECRET   = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'esp-admin-2024';
 
-app.use(cors({ origin: '*' }));
+// ── CORS — autorise toutes les origines y compris Netlify ────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 app.use(express.json());
 
 const server = http.createServer(app);
