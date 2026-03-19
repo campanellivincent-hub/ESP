@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'esp-top-secret-key-2024';
 
 // ════════════════════════════════════════════════════════════
-//  CONFIGURATION CORS (MISE À JOUR)
+//  CONFIGURATION CORS
 // ════════════════════════════════════════════════════════════
 const allowedOrigins = [
   'https://espadministrateur.netlify.app',
@@ -28,9 +28,8 @@ const allowedOrigins = [
   'http://127.0.0.1:5500'
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
-    // Autorise les requêtes sans origine (apps mobiles, outils serveurs)
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -40,7 +39,12 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
-}));
+};
+
+app.use(cors(corsOptions));
+
+// Réponse explicite aux requêtes preflight OPTIONS
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 
@@ -154,7 +158,7 @@ TOURS.forEach(tour => {
   // La transmission par le spectateur
   app.post(`/${tour}/transmit`, async (req, res) => {
     const data = { ...req.body, timestamp: Date.now() };
-    
+
     // Envoyer à tous les magiciens sur ce tour
     if (activeStreams.has(tour)) {
       const message = `data: ${JSON.stringify(data)}\n\n`;
@@ -180,7 +184,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('message', (message) => {
     const payload = JSON.parse(message);
-    
+
     // Logique de dispatching selon le type de message
     wss.clients.forEach(client => {
       if (client !== ws && client.readyState === 1) {
