@@ -408,7 +408,14 @@ TOURS.forEach(tour => {
   });
 
   app.post(`/${tour}/transmit`, async (req, res) => {
+    // Résoudre le magicien associé à la room si roomId présent
+    let magicianName = null;
+    if (req.body.roomId) {
+      const owner = users.find(u => u.roomId === req.body.roomId);
+      if (owner) magicianName = owner.name || owner.username;
+    }
     const data = { ...req.body, tour, timestamp: Date.now() };
+    if (magicianName) data.magicianName = magicianName;
     transmissions.unshift(data);
     if (transmissions.length > 200) transmissions.pop();
 
@@ -456,7 +463,16 @@ app.get('/stream', (req, res) => {
 
 app.post('/transmit', async (req, res) => {
   const tour = req.query.tour || req.body.tour || 'zener';
+
+  // Résoudre le magicien associé à la room si roomId présent
+  let magicianName = null;
+  if (req.body.roomId) {
+    const owner = users.find(u => u.roomId === req.body.roomId);
+    if (owner) magicianName = owner.name || owner.username;
+  }
+
   const data = { ...req.body, tour, timestamp: Date.now() };
+  if (magicianName) data.magicianName = magicianName;
   transmissions.unshift(data);
   if (transmissions.length > 200) transmissions.pop();
 
