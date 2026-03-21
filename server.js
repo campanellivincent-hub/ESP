@@ -371,7 +371,7 @@ app.get('/room/:roomId', (req, res) => {
   if (!user) return res.status(404).send('Room introuvable');
   // On redirige vers la page spectateur déployée sur Netlify,
   // avec le roomId en query param pour identification future
-  const spectatorBase = process.env.SPECTATOR_URL || 'https://espspectateur.netlify.app';
+  const spectatorBase = process.env.SPECTATOR_URL || 'https://esphistorique.netlify.app';
   res.redirect(`${spectatorBase}?room=${user.roomId}&for=${encodeURIComponent(user.name)}`);
 });
 
