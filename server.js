@@ -189,6 +189,30 @@ app.get('/auth/me', authenticate, (req, res) => {
   res.json({ id: user.id, username: user.username, name: user.name || user.username, role: user.role });
 });
 
+// Mise à jour du compte par le magicien lui-même
+app.post('/auth/update', authenticate, async (req, res) => {
+  const user = users.find(u => u.id === req.user.id);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  const { username, password } = req.body;
+
+  // Vérifier unicité du nouvel identifiant
+  if (username && username !== user.username) {
+    if (users.find(u => u.username === username)) {
+      return res.status(400).json({ error: 'Cet identifiant est déjà utilisé' });
+    }
+    user.username = username;
+  }
+
+  if (password && password.trim() !== '') {
+    user.password = password;
+  }
+
+  await saveUsers(users);
+  broadcastToAdmins({ type: 'user_updated', data: user, timestamp: Date.now() });
+  res.json({ success: true, user: { id: user.id, username: user.username, name: user.name, role: user.role } });
+});
+
 // ════════════════════════════════════════════════════════════
 //  ROUTES API — ADMIN USERS
 // ════════════════════════════════════════════════════════════
