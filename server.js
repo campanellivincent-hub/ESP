@@ -55,7 +55,8 @@ const redisClient = redis.createClient({ url: process.env.REDIS_URL });
 redisClient.on('error', err => console.error('Redis Error:', err));
 
 let users        = [];
-let activeStreams = new Map();
+let activeStreams = new Map();      // Map<tour, Map<clientId, res>>  — broadcast legacy
+let userStreams   = new Map();      // Map<userId, Map<clientId, res>> — canal privé magicien
 
 // Sessions actives en mémoire : Map<sessionId, sessionObj>
 const sessions = new Map();
@@ -385,42 +386,53 @@ TOURS.forEach(tour => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const clientId = Date.now();
+    const clientId = Date.now() + Math.random();
     if (!activeStreams.has(tour)) activeStreams.set(tour, new Map());
     activeStreams.get(tour).set(clientId, res);
 
-    // Mettre à jour le canal dans la session
+    // Inscrire aussi dans le canal privé de l'utilisateur
     const token = req.query.token;
+    let userId = null;
     if (token) {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
         if (decoded.sessionId && sessions.has(decoded.sessionId)) {
           sessions.get(decoded.sessionId).channel = tour;
           sessions.get(decoded.sessionId).lastActivity = Date.now();
           broadcastToAdmins({ type: 'stream_connected', data: { username: decoded.username, channel: tour }, timestamp: Date.now() });
         }
+        if (userId) {
+          if (!userStreams.has(userId)) userStreams.set(userId, new Map());
+          userStreams.get(userId).set(clientId, res);
+        }
       } catch(_) {}
     }
 
     req.on('close', () => {
-      activeStreams.get(tour).delete(clientId);
+      activeStreams.get(tour)?.delete(clientId);
+      if (userId) userStreams.get(userId)?.delete(clientId);
     });
   });
 
   app.post(`/${tour}/transmit`, async (req, res) => {
-    // Résoudre le magicien associé à la room si roomId présent
     let magicianName = null;
+    let ownerId = null;
     if (req.body.roomId) {
       const owner = users.find(u => u.roomId === req.body.roomId);
-      if (owner) magicianName = owner.name || owner.username;
+      if (owner) { magicianName = owner.name || owner.username; ownerId = owner.id; }
     }
     const data = { ...req.body, tour, timestamp: Date.now() };
     if (magicianName) data.magicianName = magicianName;
     transmissions.unshift(data);
     if (transmissions.length > 200) transmissions.pop();
 
-    if (activeStreams.has(tour)) {
-      const message = `data: ${JSON.stringify(data)}\n\n`;
+    const message = `data: ${JSON.stringify(data)}\n\n`;
+
+    // Envoi ciblé si on connaît le magicien, sinon broadcast tour
+    if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
+      userStreams.get(ownerId).forEach(client => client.write(message));
+    } else if (activeStreams.has(tour)) {
       activeStreams.get(tour).forEach(client => client.write(message));
     }
 
@@ -440,35 +452,42 @@ app.get('/stream', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const clientId = Date.now();
+  const clientId = Date.now() + Math.random();
   if (!activeStreams.has(tour)) activeStreams.set(tour, new Map());
   activeStreams.get(tour).set(clientId, res);
 
+  let userId = null;
   const token = req.query.token;
   if (token) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
+      userId = decoded.id;
       if (decoded.sessionId && sessions.has(decoded.sessionId)) {
         sessions.get(decoded.sessionId).channel = tour;
         sessions.get(decoded.sessionId).lastActivity = Date.now();
         broadcastToAdmins({ type: 'stream_connected', data: { username: decoded.username, channel: tour }, timestamp: Date.now() });
       }
+      if (userId) {
+        if (!userStreams.has(userId)) userStreams.set(userId, new Map());
+        userStreams.get(userId).set(clientId, res);
+      }
     } catch(_) {}
   }
 
   req.on('close', () => {
-    activeStreams.get(tour).delete(clientId);
+    activeStreams.get(tour)?.delete(clientId);
+    if (userId) userStreams.get(userId)?.delete(clientId);
   });
 });
 
 app.post('/transmit', async (req, res) => {
   const tour = req.query.tour || req.body.tour || 'zener';
 
-  // Résoudre le magicien associé à la room si roomId présent
   let magicianName = null;
+  let ownerId = null;
   if (req.body.roomId) {
     const owner = users.find(u => u.roomId === req.body.roomId);
-    if (owner) magicianName = owner.name || owner.username;
+    if (owner) { magicianName = owner.name || owner.username; ownerId = owner.id; }
   }
 
   const data = { ...req.body, tour, timestamp: Date.now() };
@@ -476,8 +495,12 @@ app.post('/transmit', async (req, res) => {
   transmissions.unshift(data);
   if (transmissions.length > 200) transmissions.pop();
 
-  if (activeStreams.has(tour)) {
-    const message = `data: ${JSON.stringify(data)}\n\n`;
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+
+  // Envoi ciblé si on connaît le magicien, sinon broadcast tour
+  if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
+    userStreams.get(ownerId).forEach(client => client.write(message));
+  } else if (activeStreams.has(tour)) {
     activeStreams.get(tour).forEach(client => client.write(message));
   }
 
