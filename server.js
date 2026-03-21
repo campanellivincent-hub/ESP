@@ -201,13 +201,19 @@ app.post('/admin/users', authenticate, isAdmin, async (req, res) => {
   if (!username || !password) return res.status(400).json({ error: 'Username et password requis' });
   if (users.find(u => u.username === username)) return res.status(400).json({ error: 'Cet utilisateur existe déjà' });
 
+  // Générer un roomId court (8 hex chars) et un qrToken unique
+  const roomId   = crypto.randomBytes(4).toString('hex');          // ex: "a3f9c21b"
+  const qrToken  = crypto.randomBytes(16).toString('hex');         // token opaque pour l'URL QR
+
   const newUser = {
     id: crypto.randomUUID(),
     name: name || username,
     username, password,
     role: role || 'magicien',
     active: true,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    roomId,
+    qrToken
   };
   users.push(newUser);
   await saveUsers(users);
@@ -278,8 +284,98 @@ app.get('/admin/stats', authenticate, isAdmin, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  TOURS SSE (Zener, Astro, etc.)
+//  ROUTES QR CODE & ROOM
 // ════════════════════════════════════════════════════════════
+
+// Page QR imprimable — accessible sans auth (token opaque dans l'URL)
+// GET /qr/:qrToken  → renvoie une page HTML avec le QR code
+app.get('/qr/:qrToken', (req, res) => {
+  const user = users.find(u => u.qrToken === req.params.qrToken);
+  if (!user) return res.status(404).send('QR invalide ou expiré');
+
+  const spectatorUrl = `${req.protocol}://${req.get('host')}/room/${user.roomId}`;
+
+  // On renvoie une micro-page HTML autonome (pas de dépendance externe)
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QR — ${user.name}</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#f4f0e8;font-family:'Georgia',serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#fff;border:1px solid #c4b99a;padding:48px 40px;text-align:center;max-width:400px;width:90%;box-shadow:0 4px 32px rgba(0,0,0,.08)}
+  .label{font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:#8b7355;margin-bottom:6px;font-family:'Arial',sans-serif}
+  .name{font-size:1.5rem;color:#1a1814;margin-bottom:4px;font-weight:400}
+  .room{font-family:'Courier New',monospace;font-size:12px;color:#8b7355;margin-bottom:32px;letter-spacing:.15em}
+  canvas{display:block;margin:0 auto 28px}
+  .url{font-family:'Courier New',monospace;font-size:11px;color:#8b7355;word-break:break-all;margin-bottom:32px;padding:12px;background:#f4f0e8;border:1px solid #e0d8c8}
+  .print-btn{background:transparent;border:1px solid #8b7355;color:#1a1814;font-family:'Arial',sans-serif;font-size:11px;letter-spacing:.25em;text-transform:uppercase;padding:12px 28px;cursor:pointer;transition:.2s}
+  .print-btn:hover{background:#8b7355;color:#fff}
+  .footer{margin-top:28px;font-size:9px;letter-spacing:.3em;text-transform:uppercase;color:#c4b99a;font-family:'Arial',sans-serif}
+  @media print{.print-btn{display:none}.card{border:none;box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="label">Institut de Recherche · Carte Participant</div>
+  <div class="name">${user.name}</div>
+  <div class="room">Room · ${user.roomId}</div>
+  <canvas id="qr"></canvas>
+  <div class="url">${spectatorUrl}</div>
+  <button class="print-btn" onclick="window.print()">⎙ Imprimer cette carte</button>
+  <div class="footer">Perception Extra-Sensorielle · 2024</div>
+</div>
+<script>
+  QRCode.toCanvas(document.getElementById('qr'), ${JSON.stringify(spectatorUrl)}, {
+    width: 200, margin: 2,
+    color: { dark: '#1a1814', light: '#ffffff' }
+  });
+</script>
+</body>
+</html>`);
+});
+
+// Récupère le qrToken d'un utilisateur (admin seulement)
+app.get('/admin/users/:id/qr', authenticate, isAdmin, (req, res) => {
+  const user = users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  if (!user.qrToken) {
+    // Migration : générer si absent (anciens comptes)
+    user.qrToken = crypto.randomBytes(16).toString('hex');
+    user.roomId  = user.roomId || crypto.randomBytes(4).toString('hex');
+    saveUsers(users).catch(() => {});
+  }
+  const qrUrl = `${req.protocol}://${req.get('host')}/qr/${user.qrToken}`;
+  res.json({ qrUrl, roomId: user.roomId, name: user.name });
+});
+
+// Régénère le QR code (admin seulement) — invalide l'ancien token
+app.post('/admin/users/:id/qr/regenerate', authenticate, isAdmin, async (req, res) => {
+  const user = users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  user.qrToken = crypto.randomBytes(16).toString('hex');
+  user.roomId  = crypto.randomBytes(4).toString('hex');
+  await saveUsers(users);
+  const qrUrl = `${req.protocol}://${req.get('host')}/qr/${user.qrToken}`;
+  res.json({ qrUrl, roomId: user.roomId });
+});
+
+// Route room spectateur — redirige vers la page spectateur avec roomId en paramètre
+// Permet au QR code de pointer vers une URL stable liée au compte
+app.get('/room/:roomId', (req, res) => {
+  const user = users.find(u => u.roomId === req.params.roomId);
+  if (!user) return res.status(404).send('Room introuvable');
+  // On redirige vers la page spectateur déployée sur Netlify,
+  // avec le roomId en query param pour identification future
+  const spectatorBase = process.env.SPECTATOR_URL || 'https://espspectateur.netlify.app';
+  res.redirect(`${spectatorBase}?room=${user.roomId}&for=${encodeURIComponent(user.name)}`);
+});
+
+
 const TOURS = ['zener', 'gogyo', 'oracle', 'astro', 'cadenas'];
 
 TOURS.forEach(tour => {
