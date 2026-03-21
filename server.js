@@ -196,7 +196,6 @@ app.post('/auth/update', authenticate, async (req, res) => {
 
   const { username, password } = req.body;
 
-  // Vérifier unicité du nouvel identifiant
   if (username && username !== user.username) {
     if (users.find(u => u.username === username)) {
       return res.status(400).json({ error: 'Cet identifiant est déjà utilisé' });
@@ -453,10 +452,14 @@ TOURS.forEach(tour => {
 
     const message = `data: ${JSON.stringify(data)}\n\n`;
 
-    // Envoi ciblé si on connaît le magicien, sinon broadcast tour
-    if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
-      userStreams.get(ownerId).forEach(client => client.write(message));
+    // Si un roomId est fourni, envoi ciblé uniquement — jamais de broadcast général
+    if (req.body.roomId) {
+      if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
+        userStreams.get(ownerId).forEach(client => client.write(message));
+      }
+      // roomId présent mais magicien non connecté → on ne diffuse pas aux autres
     } else if (activeStreams.has(tour)) {
+      // Pas de roomId : broadcast au canal (usage sans QR code)
       activeStreams.get(tour).forEach(client => client.write(message));
     }
 
@@ -521,10 +524,14 @@ app.post('/transmit', async (req, res) => {
 
   const message = `data: ${JSON.stringify(data)}\n\n`;
 
-  // Envoi ciblé si on connaît le magicien, sinon broadcast tour
-  if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
-    userStreams.get(ownerId).forEach(client => client.write(message));
+  // Si un roomId est fourni, envoi ciblé uniquement — jamais de broadcast général
+  if (req.body.roomId) {
+    if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
+      userStreams.get(ownerId).forEach(client => client.write(message));
+    }
+    // roomId présent mais magicien non connecté → on ne diffuse pas aux autres
   } else if (activeStreams.has(tour)) {
+    // Pas de roomId : broadcast au canal (usage sans QR code)
     activeStreams.get(tour).forEach(client => client.write(message));
   }
 
