@@ -294,7 +294,7 @@ app.get('/qr/:qrToken', (req, res) => {
   const user = users.find(u => u.qrToken === req.params.qrToken);
   if (!user) return res.status(404).send('QR invalide ou expiré');
 
-  const spectatorUrl = `${req.protocol}://${req.get('host')}/room/${user.roomId}`;
+  const spectatorUrl = `https://${req.get('host')}/room/${user.roomId}`;
 
   // On renvoie une micro-page HTML autonome (pas de dépendance externe)
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -350,7 +350,7 @@ app.get('/admin/users/:id/qr', authenticate, isAdmin, (req, res) => {
     user.roomId  = user.roomId || crypto.randomBytes(4).toString('hex');
     saveUsers(users).catch(() => {});
   }
-  const qrUrl = `${req.protocol}://${req.get('host')}/qr/${user.qrToken}`;
+  const qrUrl = `https://${req.get('host')}/qr/${user.qrToken}`;
   res.json({ qrUrl, roomId: user.roomId, name: user.name });
 });
 
@@ -361,7 +361,7 @@ app.post('/admin/users/:id/qr/regenerate', authenticate, isAdmin, async (req, re
   user.qrToken = crypto.randomBytes(16).toString('hex');
   user.roomId  = crypto.randomBytes(4).toString('hex');
   await saveUsers(users);
-  const qrUrl = `${req.protocol}://${req.get('host')}/qr/${user.qrToken}`;
+  const qrUrl = `https://${req.get('host')}/qr/${user.qrToken}`;
   res.json({ qrUrl, roomId: user.roomId });
 });
 
