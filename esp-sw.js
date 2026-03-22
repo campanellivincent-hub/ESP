@@ -1,94 +1,59 @@
 // ══════════════════════════════════════════════════════════════════
-//  ESP SERVICE WORKER — Maintient le SSE en arrière-plan
-//  Tourne dans un thread séparé, indépendant de l'état de la page
+//  ESP SERVICE WORKER
+//  - Reçoit les push notifications du serveur (même page fermée)
+//  - Vibre selon le symbole reçu
+//  - Transmet à la page si elle est ouverte (affichage)
 // ══════════════════════════════════════════════════════════════════
 
-const SW_VERSION = 'esp-sw-v1';
+self.addEventListener('install',  () => self.skipWaiting());
+self.addEventListener('activate', () => self.clients.claim());
 
-let sseUrl         = null;
-let eventSource    = null;
-let lastTimestamp  = null;
-let connectedPorts = [];   // MessagePorts vers la page principale
+const SYMBOLS = { cercle: 1, croix: 2, vagues: 3, carre: 4, etoile: 5 };
 
-// ── Réception des messages de la page ────────────────────────────
-self.addEventListener('message', (e) => {
-  const { type, payload } = e.data || {};
+// ── Push reçu depuis le serveur ───────────────────────────────────
+self.addEventListener('push', (event) => {
+  if (!event.data) return;
+  let payload;
+  try { payload = event.data.json(); } catch(_) { return; }
 
-  // Enregistre le port de communication avec la page
-  if (e.ports && e.ports[0]) {
-    const port = e.ports[0];
-    connectedPorts.push(port);
-    port.onmessage = (ev) => handlePortMessage(ev, port);
-    port.start();
-  }
+  const symbol = payload.symbol;
+  const n      = SYMBOLS[symbol] || 0;
+  if (!n) return;
 
-  if (type === 'START_SSE') {
-    sseUrl = payload.url;
-    lastTimestamp = null;
-    startSSE();
-  }
+  event.waitUntil((async () => {
+    // Transmettre à la page si elle est ouverte
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (clients.length > 0) {
+      clients.forEach(c => c.postMessage({
+        type: 'SYMBOL_RECEIVED', symbol, timestamp: payload.timestamp
+      }));
+    }
 
-  if (type === 'STOP_SSE') {
-    stopSSE();
-  }
+    // Vibrer depuis le SW (Android)
+    const dur = payload.vibrationMs || 300;
+    const pattern = [];
+    for (let i = 0; i < n; i++) { pattern.push(dur); if (i < n-1) pattern.push(200); }
+    await new Promise(r => setTimeout(r, 700));
+    if (self.registration?.vibrate) self.registration.vibrate(pattern);
+
+    // Notification silencieuse et discrète (réveille iOS)
+    await self.registration.showNotification(' ', {
+      body: ' ', silent: true, tag: 'esp-signal',
+      renotify: false, data: { symbol, timestamp: payload.timestamp }
+    });
+  })());
 });
 
-function handlePortMessage(e, port) {
-  const { type, payload } = e.data || {};
-  if (type === 'START_SSE') {
-    sseUrl = payload.url;
-    lastTimestamp = null;
-    startSSE();
-  }
-  if (type === 'STOP_SSE') {
-    stopSSE();
-  }
-}
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window' }).then(clients => {
+      if (clients.length > 0) { clients[0].focus(); return; }
+      self.clients.openWindow('./');
+    })
+  );
+});
 
-// ── Broadcast vers tous les ports connectés ───────────────────────
-function broadcast(msg) {
-  connectedPorts = connectedPorts.filter(p => {
-    try { p.postMessage(msg); return true; } catch(_) { return false; }
-  });
-}
-
-// ── Connexion SSE ─────────────────────────────────────────────────
-function startSSE() {
-  if (eventSource) { eventSource.close(); eventSource = null; }
-  if (!sseUrl) return;
-
-  broadcast({ type: 'SSE_STATUS', status: 'connecting' });
-
-  eventSource = new EventSource(sseUrl);
-
-  eventSource.onopen = () => {
-    broadcast({ type: 'SSE_STATUS', status: 'connected' });
-  };
-
-  eventSource.onmessage = (e) => {
-    try {
-      const d = JSON.parse(e.data);
-      if (!d.symbol || !d.timestamp) return;
-      const age = Date.now() - d.timestamp;
-      if (age > 60_000) return;
-      if (d.timestamp === lastTimestamp) return;
-      lastTimestamp = d.timestamp;
-      // Envoie le symbole reçu à la page
-      broadcast({ type: 'SYMBOL_RECEIVED', symbol: d.symbol, timestamp: d.timestamp });
-    } catch(_) {}
-  };
-
-  eventSource.onerror = () => {
-    broadcast({ type: 'SSE_STATUS', status: 'reconnecting' });
-    // EventSource se reconnecte automatiquement
-  };
-}
-
-function stopSSE() {
-  if (eventSource) { eventSource.close(); eventSource = null; }
-  broadcast({ type: 'SSE_STATUS', status: 'stopped' });
-}
-
-// ── Keepalive : ping périodique pour que le SW reste actif ────────
-self.addEventListener('activate', () => self.clients.claim());
-self.addEventListener('install',  () => self.skipWaiting());
+self.addEventListener('message', (e) => {
+  if (e.data?.type === 'PING' && e.ports?.[0]) e.ports[0].postMessage({ type: 'PONG' });
+});

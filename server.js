@@ -13,6 +13,42 @@ const { WebSocketServer } = require('ws');
 const redis = require('redis');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const path = require('path');
+const fs   = require('fs');
+
+// ── Web Push (implémentation native sans dépendance externe) ──────
+// Génère ou charge les clés VAPID au démarrage
+let VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+let VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+
+function generateVapidKeys() {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', {
+    namedCurve: 'prime256v1',
+    publicKeyEncoding:  { type: 'spki',  format: 'der' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'der' }
+  });
+  // Extraire les 65 octets de la clé publique non-compressée (offset 27)
+  const pubRaw = publicKey.slice(27);
+  // Extraire les 32 octets de la clé privée (offset 36)
+  const privRaw = privateKey.slice(36);
+  return {
+    publicKey:  Buffer.from(pubRaw).toString('base64url'),
+    privateKey: Buffer.from(privRaw).toString('base64url')
+  };
+}
+
+if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+  const keys = generateVapidKeys();
+  VAPID_PUBLIC_KEY  = keys.publicKey;
+  VAPID_PRIVATE_KEY = keys.privateKey;
+  console.log('⚠️  Clés VAPID générées dynamiquement. Pour les fixer, ajoutez dans les variables d\'env :');
+  console.log('   VAPID_PUBLIC_KEY=' + VAPID_PUBLIC_KEY);
+  console.log('   VAPID_PRIVATE_KEY=' + VAPID_PRIVATE_KEY);
+}
+
+// Map<userId, Set<subscriptionObject>> — abonnements push en mémoire
+// (persistés aussi dans Redis)
+const pushSubscriptions = new Map();
 
 const app = express();
 const server = http.createServer(app);
@@ -48,18 +84,10 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
-// ════════════════════════════════════════════════════════════
-//  SERVICE WORKER — servi avec les bons headers
-//  (doit être à la racine du scope de l'app magicien)
-// ════════════════════════════════════════════════════════════
-const path = require('path');
-const fs   = require('fs');
-
+// ── Service Worker — servi avec les bons headers ──────────────────
 app.get('/esp-sw.js', (req, res) => {
   const swPath = path.join(__dirname, 'esp-sw.js');
-  if (!fs.existsSync(swPath)) {
-    return res.status(404).send('Service worker not found');
-  }
+  if (!fs.existsSync(swPath)) return res.status(404).send('SW not found');
   res.setHeader('Content-Type', 'application/javascript');
   res.setHeader('Service-Worker-Allowed', '/');
   res.setHeader('Cache-Control', 'no-cache');
@@ -199,13 +227,219 @@ app.post('/auth/login', async (req, res) => {
 app.get('/auth/me', authenticate, (req, res) => {
   const user = users.find(u => u.id === req.user.id);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
-
-  // Mettre à jour lastActivity de la session
   if (req.user.sessionId && sessions.has(req.user.sessionId)) {
     sessions.get(req.user.sessionId).lastActivity = Date.now();
   }
   res.json({ id: user.id, username: user.username, name: user.name || user.username, role: user.role });
 });
+
+// ════════════════════════════════════════════════════════════
+//  WEB PUSH — Routes et helpers
+// ════════════════════════════════════════════════════════════
+
+// Clé publique VAPID (pour le client)
+app.get('/push/vapid-public-key', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.send(VAPID_PUBLIC_KEY);
+});
+
+// Enregistrement d'un abonnement push
+app.post('/push/subscribe', authenticate, async (req, res) => {
+  const sub = req.body; // PushSubscription JSON
+  if (!sub?.endpoint) return res.status(400).json({ error: 'Abonnement invalide' });
+  const userId = req.user.id;
+
+  if (!pushSubscriptions.has(userId)) pushSubscriptions.set(userId, new Set());
+  // Déduplique par endpoint
+  const subs = pushSubscriptions.get(userId);
+  for (const s of subs) { if (s.endpoint === sub.endpoint) subs.delete(s); }
+  subs.add(sub);
+
+  // Persiste dans Redis
+  try {
+    const key = `esp_push_${userId}`;
+    await redisClient.set(key, JSON.stringify([...subs]));
+  } catch(_) {}
+
+  res.json({ success: true });
+});
+
+// Désabonnement
+app.post('/push/unsubscribe', authenticate, async (req, res) => {
+  const { endpoint } = req.body;
+  const userId = req.user.id;
+  if (pushSubscriptions.has(userId)) {
+    for (const s of pushSubscriptions.get(userId)) {
+      if (s.endpoint === endpoint) { pushSubscriptions.get(userId).delete(s); break; }
+    }
+    try {
+      const key = `esp_push_${userId}`;
+      await redisClient.set(key, JSON.stringify([...pushSubscriptions.get(userId)]));
+    } catch(_) {}
+  }
+  res.json({ success: true });
+});
+
+// ── Chargement des abonnements depuis Redis au démarrage ──────────
+async function loadPushSubscriptions() {
+  try {
+    const userList = await loadUsers();
+    for (const u of userList) {
+      const raw = await redisClient.get(`esp_push_${u.id}`);
+      if (raw) {
+        const subs = JSON.parse(raw);
+        if (subs.length) pushSubscriptions.set(u.id, new Set(subs));
+      }
+    }
+  } catch(_) {}
+}
+
+// ── Envoi d'une notification push Web Push (RFC 8292 / VAPID) ────
+async function sendPushToUser(userId, payload) {
+  const subs = pushSubscriptions.get(userId);
+  if (!subs || subs.size === 0) return;
+
+  const deadSubs = [];
+  for (const sub of subs) {
+    try {
+      await sendWebPush(sub, payload);
+    } catch(err) {
+      // 404/410 = abonnement expiré
+      if (err.statusCode === 404 || err.statusCode === 410) deadSubs.push(sub);
+    }
+  }
+  // Nettoyage des abonnements expirés
+  for (const s of deadSubs) subs.delete(s);
+}
+
+// Implémentation Web Push VAPID sans librairie externe
+async function sendWebPush(subscription, payload) {
+  const endpoint = new URL(subscription.endpoint);
+  const payloadStr = JSON.stringify(payload);
+
+  // ── 1. Chiffrement du payload (RFC 8291) ──────────────────────
+  const salt = crypto.randomBytes(16);
+
+  // Clé publique du client
+  const clientPubKeyB64 = subscription.keys?.p256dh;
+  const authSecretB64   = subscription.keys?.auth;
+  if (!clientPubKeyB64 || !authSecretB64) {
+    // Pas de chiffrement possible — envoi vide (juste un ping)
+    return sendWebPushRaw(endpoint, null, salt, subscription);
+  }
+
+  const clientPubKey  = Buffer.from(clientPubKeyB64, 'base64url');
+  const authSecret    = Buffer.from(authSecretB64, 'base64url');
+
+  // Génère une paire de clés éphémère
+  const { privateKey: senderPrivDer, publicKey: senderPubDer } =
+    crypto.generateKeyPairSync('ec', {
+      namedCurve: 'prime256v1',
+      publicKeyEncoding:  { type: 'spki',  format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'der' }
+    });
+
+  const senderPubRaw = senderPubDer.slice(27); // 65 octets non-compressés
+
+  // ECDH avec la clé publique du client
+  const clientKeyObj = crypto.createPublicKey({
+    key: Buffer.concat([
+      Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex'),
+      clientPubKey
+    ]),
+    format: 'der', type: 'spki'
+  });
+  const senderPrivObj = crypto.createPrivateKey({ key: senderPrivDer, format: 'der', type: 'pkcs8' });
+  const sharedSecret = crypto.diffieHellman({ privateKey: senderPrivObj, publicKey: clientKeyObj });
+
+  // Dérivation de clé HKDF (RFC 5869)
+  const prk = await hkdf(authSecret, sharedSecret,
+    Buffer.concat([Buffer.from('WebPush: info\x00'), clientPubKey, senderPubRaw]), 32);
+  const cek = await hkdf(salt, prk, Buffer.from('Content-Encoding: aes128gcm\x00'), 16);
+  const nonce = await hkdf(salt, prk, Buffer.from('Content-Encoding: nonce\x00'), 12);
+
+  // Chiffrement AES-128-GCM
+  const cipher = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const plaintext = Buffer.concat([Buffer.from(payloadStr), Buffer.from([2])]); // padding delimiter
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+
+  // Header d'enveloppe (RFC 8291 §2.1)
+  const recordSize = Buffer.alloc(4); recordSize.writeUInt32BE(encrypted.length + 16 + 1, 0);
+  const keyIdLen   = Buffer.alloc(1); keyIdLen.writeUInt8(senderPubRaw.length, 0);
+  const body = Buffer.concat([salt, recordSize, keyIdLen, senderPubRaw, encrypted]);
+
+  return sendWebPushRaw(endpoint, body, senderPubRaw, subscription);
+}
+
+async function hkdf(salt, ikm, info, length) {
+  // HKDF-Extract
+  const prk = crypto.createHmac('sha256', salt).update(ikm).digest();
+  // HKDF-Expand
+  const T = crypto.createHmac('sha256', prk)
+    .update(Buffer.concat([info, Buffer.from([1])])).digest();
+  return T.slice(0, length);
+}
+
+async function sendWebPushRaw(endpoint, body, senderPubRaw, subscription) {
+  // ── 2. Token VAPID JWT ─────────────────────────────────────────
+  const audience = `${endpoint.protocol}//${endpoint.host}`;
+  const header   = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
+  const claims   = Buffer.from(JSON.stringify({
+    aud: audience,
+    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+    sub: 'mailto:esp@example.com'
+  })).toString('base64url');
+
+  const sigInput  = `${header}.${claims}`;
+  const privKeyDer = Buffer.from(
+    '308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420' +
+    Buffer.from(VAPID_PRIVATE_KEY, 'base64url').toString('hex') +
+    'a144034200' +
+    Buffer.from(VAPID_PUBLIC_KEY, 'base64url').toString('hex'),
+    'hex'
+  );
+  const privKeyObj = crypto.createPrivateKey({ key: privKeyDer, format: 'der', type: 'sec1' });
+  const sigDer     = crypto.sign('sha256', Buffer.from(sigInput), { key: privKeyObj, dsaEncoding: 'ieee-p1363' });
+  const token      = `${sigInput}.${sigDer.toString('base64url')}`;
+  const vapidAuth  = `vapid t=${token},k=${VAPID_PUBLIC_KEY}`;
+
+  // ── 3. Requête HTTP POST vers le push service ──────────────────
+  const https  = require('https');
+  const reqOpts = {
+    hostname: endpoint.hostname,
+    port:     endpoint.port || 443,
+    path:     endpoint.pathname + endpoint.search,
+    method:   'POST',
+    headers:  {
+      'Authorization':   vapidAuth,
+      'TTL':             '60',
+      'Urgency':         'high',
+    }
+  };
+  if (body) {
+    reqOpts.headers['Content-Type']     = 'application/octet-stream';
+    reqOpts.headers['Content-Encoding'] = 'aes128gcm';
+    reqOpts.headers['Content-Length']   = body.length;
+  } else {
+    reqOpts.headers['Content-Length'] = 0;
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(reqOpts, (res) => {
+      res.resume();
+      if (res.statusCode >= 400) {
+        const err = new Error(`Push failed: ${res.statusCode}`);
+        err.statusCode = res.statusCode;
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
 
 // Mise à jour du compte par le magicien lui-même
 app.post('/auth/update', authenticate, async (req, res) => {
@@ -472,7 +706,14 @@ TOURS.forEach(tour => {
       if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
         userStreams.get(ownerId).forEach(client => client.write(message));
       }
-      // roomId présent mais magicien non connecté → on ne diffuse pas aux autres
+      // Envoi push (arrière-plan / écran verrouillé)
+      if (ownerId) {
+        sendPushToUser(ownerId, {
+          symbol: req.body.symbol || data.symbol,
+          timestamp: data.timestamp,
+          vibrationMs: 300
+        }).catch(() => {});
+      }
     } else if (activeStreams.has(tour)) {
       // Pas de roomId : broadcast au canal (usage sans QR code)
       activeStreams.get(tour).forEach(client => client.write(message));
@@ -544,9 +785,15 @@ app.post('/transmit', async (req, res) => {
     if (ownerId && userStreams.has(ownerId) && userStreams.get(ownerId).size > 0) {
       userStreams.get(ownerId).forEach(client => client.write(message));
     }
-    // roomId présent mais magicien non connecté → on ne diffuse pas aux autres
+    // Envoi push (arrière-plan / écran verrouillé)
+    if (ownerId) {
+      sendPushToUser(ownerId, {
+        symbol: req.body.symbol || data.symbol,
+        timestamp: data.timestamp,
+        vibrationMs: 300
+      }).catch(() => {});
+    }
   } else if (activeStreams.has(tour)) {
-    // Pas de roomId : broadcast au canal (usage sans QR code)
     activeStreams.get(tour).forEach(client => client.write(message));
   }
 
@@ -609,6 +856,7 @@ async function start() {
   try {
     await redisClient.connect();
     users = await loadUsers();
+    await loadPushSubscriptions();
   } catch (err) {
     console.error('Redis indisponible, démarrage sans persistance :', err);
     users = [];
