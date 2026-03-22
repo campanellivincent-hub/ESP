@@ -319,44 +319,41 @@ app.get('/qr/:qrToken', (req, res) => {
 
   const spectatorUrl = `https://${req.get('host')}/room/${user.roomId}`;
 
-  // On renvoie une micro-page HTML autonome (pas de dépendance externe)
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QR — ${user.name}</title>
+<title>Accès invité</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#f4f0e8;font-family:'Georgia',serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
-  .card{background:#fff;border:1px solid #c4b99a;padding:48px 40px;text-align:center;max-width:400px;width:90%;box-shadow:0 4px 32px rgba(0,0,0,.08)}
-  .label{font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:#8b7355;margin-bottom:6px;font-family:'Arial',sans-serif}
-  .name{font-size:1.5rem;color:#1a1814;margin-bottom:4px;font-weight:400}
-  .room{font-family:'Courier New',monospace;font-size:12px;color:#8b7355;margin-bottom:32px;letter-spacing:.15em}
-  canvas{display:block;margin:0 auto 28px}
-  .url{font-family:'Courier New',monospace;font-size:11px;color:#8b7355;word-break:break-all;margin-bottom:32px;padding:12px;background:#f4f0e8;border:1px solid #e0d8c8}
-  .print-btn{background:transparent;border:1px solid #8b7355;color:#1a1814;font-family:'Arial',sans-serif;font-size:11px;letter-spacing:.25em;text-transform:uppercase;padding:12px 28px;cursor:pointer;transition:.2s}
-  .print-btn:hover{background:#8b7355;color:#fff}
-  .footer{margin-top:28px;font-size:9px;letter-spacing:.3em;text-transform:uppercase;color:#c4b99a;font-family:'Arial',sans-serif}
-  @media print{.print-btn{display:none}.card{border:none;box-shadow:none}}
+  body{background:#f0f0f0;font-family:Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#fff;border-radius:8px;padding:32px 28px;text-align:center;max-width:280px;width:90%;box-shadow:0 2px 12px rgba(0,0,0,.10)}
+  .wifi-icon{font-size:28px;margin-bottom:12px;color:#333}
+  .title{font-size:15px;font-weight:700;color:#111;margin-bottom:4px}
+  .sub{font-size:12px;color:#888;margin-bottom:20px}
+  canvas{display:block;margin:0 auto 18px;border-radius:4px}
+  .hint{font-size:11px;color:#aaa;margin-bottom:20px;line-height:1.5}
+  .print-btn{background:#111;color:#fff;border:none;border-radius:4px;font-family:Arial,sans-serif;font-size:12px;padding:10px 24px;cursor:pointer;transition:background .2s}
+  .print-btn:hover{background:#333}
+  @media print{.print-btn{display:none}body{background:#fff}.card{box-shadow:none;border:1px solid #ddd}}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="label">Institut de Recherche · Carte Participant</div>
-  <div class="name">${user.name}</div>
-  <div class="room">Room · ${user.roomId}</div>
+  <div class="wifi-icon">📶</div>
+  <div class="title">Accès invité</div>
+  <div class="sub">Scannez pour accéder au site</div>
   <canvas id="qr"></canvas>
-  <div class="url">${spectatorUrl}</div>
-  <button class="print-btn" onclick="window.print()">⎙ Imprimer cette carte</button>
-  <div class="footer">Perception Extra-Sensorielle · 2024</div>
+  <div class="hint">Pointez l'appareil photo de votre<br>téléphone vers ce code</div>
+  <button class="print-btn" onclick="window.print()">Imprimer</button>
 </div>
 <script>
   QRCode.toCanvas(document.getElementById('qr'), ${JSON.stringify(spectatorUrl)}, {
-    width: 200, margin: 2,
-    color: { dark: '#1a1814', light: '#ffffff' }
+    width: 180, margin: 2,
+    color: { dark: '#111111', light: '#ffffff' }
   });
 </script>
 </body>
