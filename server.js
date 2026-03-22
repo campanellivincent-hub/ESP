@@ -31,9 +31,11 @@ function generateVapidKeys() {
   const pubRaw = publicKey.slice(27);
   // Extraire les 32 octets de la clé privée (offset 36)
   const privRaw = privateKey.slice(36);
+  // pubRaw  = 64 octets (x||y sans préfixe 04)
+  // privRaw = scalaire brut de 32 octets (les 32 premiers octets du résidu pkcs8)
   return {
     publicKey:  Buffer.from(pubRaw).toString('base64url'),
-    privateKey: Buffer.from(privRaw).toString('base64url')
+    privateKey: Buffer.from(privRaw).slice(0, 32).toString('base64url')
   };
 }
 
@@ -391,14 +393,23 @@ async function sendWebPushRaw(endpoint, body, senderPubRaw, subscription) {
   })).toString('base64url');
 
   const sigInput  = `${header}.${claims}`;
-  const privKeyDer = Buffer.from(
-    '308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420' +
-    Buffer.from(VAPID_PRIVATE_KEY, 'base64url').toString('hex') +
-    'a144034200' +
-    Buffer.from(VAPID_PUBLIC_KEY, 'base64url').toString('hex'),
-    'hex'
-  );
-  const privKeyObj = crypto.createPrivateKey({ key: privKeyDer, format: 'der', type: 'sec1' });
+
+  // Reconstruction robuste de la clé privée EC sans préfixe DER codé en dur.
+  // VAPID_PUBLIC_KEY  = 64 octets base64url (x||y, sans préfixe 04)
+  // VAPID_PRIVATE_KEY = 32 octets base64url (scalaire d)
+  // On passe par JWK (RFC 7518 §6.2) — padding et longueur gérés nativement.
+  const pubBuf  = Buffer.from(VAPID_PUBLIC_KEY,  'base64url');
+  const privBuf = Buffer.from(VAPID_PRIVATE_KEY, 'base64url');
+  const privKeyObj = crypto.createPrivateKey({
+    key: {
+      kty: 'EC',
+      crv: 'P-256',
+      d:   privBuf.slice(0, 32).toString('base64url'), // scalaire 32 octets
+      x:   pubBuf.slice(0, 32).toString('base64url'),
+      y:   pubBuf.slice(32, 64).toString('base64url'),
+    },
+    format: 'jwk',
+  });
   const sigDer     = crypto.sign('sha256', Buffer.from(sigInput), { key: privKeyObj, dsaEncoding: 'ieee-p1363' });
   const token      = `${sigInput}.${sigDer.toString('base64url')}`;
   const vapidAuth  = `vapid t=${token},k=${VAPID_PUBLIC_KEY}`;
