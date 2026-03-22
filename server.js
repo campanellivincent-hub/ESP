@@ -49,6 +49,24 @@ app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // ════════════════════════════════════════════════════════════
+//  SERVICE WORKER — servi avec les bons headers
+//  (doit être à la racine du scope de l'app magicien)
+// ════════════════════════════════════════════════════════════
+const path = require('path');
+const fs   = require('fs');
+
+app.get('/esp-sw.js', (req, res) => {
+  const swPath = path.join(__dirname, 'esp-sw.js');
+  if (!fs.existsSync(swPath)) {
+    return res.status(404).send('Service worker not found');
+  }
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Service-Worker-Allowed', '/');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(swPath);
+});
+
+// ════════════════════════════════════════════════════════════
 //  REDIS & ÉTAT GLOBAL
 // ════════════════════════════════════════════════════════════
 const redisClient = redis.createClient({ url: process.env.REDIS_URL });
